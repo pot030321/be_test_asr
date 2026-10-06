@@ -1,0 +1,4 @@
+# Install into the existing ASR virtualenv on the GPU host to reuse its CUDA libraries.
+fastapi==0.142.2
+uvicorn==0.54.0
+faster-whisper==1.2.1
