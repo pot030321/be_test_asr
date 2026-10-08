@@ -13,11 +13,14 @@ import os
 import re
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -32,6 +35,63 @@ MODEL_SUBPATH = Path(
     "models--Systran--faster-whisper-large-v3/snapshots"
 )
 LANGUAGE_NAMES = {"vi": "Tiếng Việt", "en": "English"}
+
+
+class RequestTracker:
+    """Keep bounded, in-memory request metadata without retaining audio or transcripts."""
+
+    def __init__(self, recent_limit: int = 100) -> None:
+        self._lock = Lock()
+        self._recent: deque[dict[str, Any]] = deque(maxlen=recent_limit)
+        self._active = 0
+        self._waiting = 0
+        self._processing = 0
+        self._total = 0
+        self._succeeded = 0
+        self._failed = 0
+
+    def start(self) -> None:
+        with self._lock:
+            self._active += 1
+
+    def start_waiting(self) -> None:
+        with self._lock:
+            self._waiting += 1
+
+    def acquired_slot(self) -> None:
+        with self._lock:
+            self._waiting = max(0, self._waiting - 1)
+            self._processing += 1
+
+    def timed_out_waiting(self) -> None:
+        with self._lock:
+            self._waiting = max(0, self._waiting - 1)
+
+    def released_slot(self) -> None:
+        with self._lock:
+            self._processing = max(0, self._processing - 1)
+
+    def finish(self, entry: dict[str, Any]) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            self._total += 1
+            if entry["status"] < 400:
+                self._succeeded += 1
+            else:
+                self._failed += 1
+            self._recent.appendleft(entry)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "active_requests": self._active,
+                "waiting_requests": self._waiting,
+                "processing_requests": self._processing,
+                "total_requests": self._total,
+                "succeeded_requests": self._succeeded,
+                "failed_requests": self._failed,
+                "recent_requests": list(self._recent),
+            }
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -215,6 +275,35 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    app.state.request_tracker = RequestTracker()
+
+    @app.middleware("http")
+    async def track_transcription_requests(request: Request, call_next):
+        if request.method != "POST" or request.url.path != "/api/transcribe":
+            return await call_next(request)
+
+        request_id = uuid.uuid4().hex[:12]
+        started = time.perf_counter()
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        request.state.request_id = request_id
+        request.state.asr_log_details = {}
+        tracker: RequestTracker = request.app.state.request_tracker
+        tracker.start()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            entry = {
+                **request.state.asr_log_details,
+                "timestamp": started_at,
+                "request_id": request_id,
+                "status": status,
+                "request_s": time.perf_counter() - started,
+            }
+            tracker.finish(entry)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(config.allowed_origins),
@@ -228,9 +317,20 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ready", "model": "faster-whisper-large-v3"}
 
+    @app.get("/api/metrics")
+    async def metrics(request: Request) -> dict[str, Any]:
+        supplied = request.headers.get("X-ASR-Token", "")
+        if not hmac.compare_digest(supplied, config.token):
+            raise HTTPException(status_code=401, detail="Access token is invalid.")
+        return {
+            "status": "ready",
+            "max_inflight": config.max_inflight,
+            **request.app.state.request_tracker.snapshot(),
+        }
+
     @app.post("/api/transcribe")
     async def api_transcribe(request: Request) -> dict[str, Any]:
-        request_id = uuid.uuid4().hex[:12]
+        request_id = request.state.request_id
         supplied = request.headers.get("X-ASR-Token", "")
         if not hmac.compare_digest(supplied, config.token):
             raise HTTPException(status_code=401, detail="Access token is invalid.")
@@ -248,16 +348,25 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Invalid Content-Length.") from exc
 
         arrived = time.perf_counter()
+        tracker: RequestTracker = request.app.state.request_tracker
+        tracker.start_waiting()
         try:
             await asyncio.wait_for(
                 request.app.state.inflight.acquire(),
                 timeout=config.queue_timeout_s,
             )
         except TimeoutError as exc:
+            tracker.timed_out_waiting()
+            request.state.asr_log_details = {"queue_s": config.queue_timeout_s}
             raise HTTPException(status_code=429, detail="ASR queue is full; retry shortly.") from exc
+        except asyncio.CancelledError:
+            tracker.timed_out_waiting()
+            raise
 
+        tracker.acquired_slot()
         try:
             admitted = time.perf_counter()
+            request.state.asr_log_details = {"queue_s": max(0.0, admitted - arrived)}
             body_parts: list[bytes] = []
             body_size = 0
             async for chunk in request.stream():
@@ -282,6 +391,14 @@ def create_app(
                 ) from exc
 
             finished = time.perf_counter()
+            request.state.asr_log_details = {
+                "language": result["language"],
+                "audio_s": result["audio_s"],
+                "inference_s": result["inference_s"],
+                "rtf": result["rtf"],
+                "queue_s": max(0.0, admitted - arrived),
+                "size_mb": len(audio) / (1024 * 1024),
+            }
             return {
                 **result,
                 "language_name": LANGUAGE_NAMES.get(result["language"], result["language"]),
@@ -292,6 +409,7 @@ def create_app(
                 "request_id": request_id,
             }
         finally:
+            tracker.released_slot()
             request.app.state.inflight.release()
 
     return app

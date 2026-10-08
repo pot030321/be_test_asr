@@ -30,7 +30,9 @@ Replace the exact origin with your QA deployment. The regex permits Vercel previ
 
 ## API contract
 
-`POST /api/transcribe` accepts multipart form fields `file` and `language` (`auto`, `vi`, or `en`) with `X-ASR-Token`. It returns the transcript, detected language, audio duration, inference time, server request time, queue wait, file size, and RTF. `request_s` is measured inside the API; browser E2E additionally includes upload and network time.
+`POST /api/transcribe` accepts multipart form fields `file` and `language` (`auto`, `vi`, or `en`) with `X-ASR-Token`. It returns the transcript, detected language, audio duration, inference time, server request time, queue wait, file size, and RTF. RTF is `inference_s / audio_s`. `request_s` is measured inside the API; browser E2E additionally includes upload and network time.
+
+`GET /api/metrics` uses the same `X-ASR-Token` and reports active requests, inference slots, queued requests, success/error totals, and the latest 100 request records. It stores timing and status metadata only—never audio or transcript—and the in-memory history resets when the API restarts. The FE polls this endpoint to show live CCU pressure and recent latency/RTF for requests from both the browser and load-test clients.
 
 Example:
 
