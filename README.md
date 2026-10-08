@@ -1,61 +1,115 @@
-# ASR QA API
+# Backend ASR QA
 
-FastAPI test service for the locally cached `faster-whisper-large-v3` CTranslate2 checkpoint. It serves `/healthz` and an authenticated multipart endpoint at `/api/transcribe`. It never downloads model weights, writes uploaded audio, or stores transcripts. The model stays resident in one API process; upload and inference concurrency are capped.
+FastAPI backend nhận audio, trả transcript và số liệu thời gian. Trọng số model không nằm trong repo; mỗi máy chạy BE cần có checkpoint trên ổ đĩa. Backend không tự tải model và không lưu audio hoặc transcript.
 
-## Run on the existing GPU host
+## Chạy BE trên máy local
 
-This host already has the model and its CUDA-enabled ASR virtualenv. From this directory:
+### 1. Clone repo và cài môi trường Python
 
-```bash
+~~~bash
+git clone https://github.com/pot030321/be_test_asr.git
+cd be_test_asr
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install --upgrade huggingface_hub
+~~~
+
+Nếu máy dùng NVIDIA GPU trên Linux, cài CUDA libraries tương thích với NVIDIA driver và CTranslate2. Hướng dẫn hiện tại của faster-whisper dùng CUDA 12 và cuDNN 9:
+
+~~~bash
+python -m pip install nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*' nvidia-cuda-nvrtc-cu12
+~~~
+
+Máy không có NVIDIA GPU có thể chạy CPU để kiểm tra chức năng. Trong file **.env**, đặt **ASR_DEVICE=cpu**, **ASR_COMPUTE_TYPE=int8**, **ASR_MODEL_WORKERS=1** và **ASR_MAX_INFLIGHT=1**. Nhận dạng bằng model lớn trên CPU sẽ chậm hơn đáng kể.
+
+### 2. Lấy model về máy
+
+Model không được tải tự động khi API khởi động. Nếu đã có checkpoint, dùng đường dẫn hiện có ở **ASR_MODEL_PATH** hoặc **ASR_MODEL_CACHE**. Nếu chưa có, model upstream chiếm khoảng 3.1 GB; kiểm tra ổ đĩa trước khi tải. Có thể dùng repo model baseline riêng để tải qua Git LFS: [model_ASR_testing](https://github.com/pot030321/model_ASR_testing).
+
+Cách tải trực tiếp vào cache riêng của repo BE:
+
+~~~bash
+df -h .
+hf download Systran/faster-whisper-large-v3 --cache-dir ./models --dry-run
+# Chỉ chạy lệnh tải sau khi đã kiểm tra dung lượng dự kiến.
+hf download Systran/faster-whisper-large-v3 --cache-dir ./models
+~~~
+
+Lệnh trên tạo thư mục cache mà **ASR_MODEL_CACHE=./models** bên dưới có thể đọc. Trang model upstream khai báo license MIT và mô tả đây là checkpoint CTranslate2. Khi dùng GitHub LFS, người tải cần được cấp quyền vào repo model và cài Git LFS.
+
+### 3. Tạo token và cấu hình BE
+
+~~~bash
 cp .env.example .env
-set -a && source .env && set +a
-export ASR_API_TOKEN="$(/home/phongnth/asr-bestmodel/.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+~~~
+
+Dán token vừa tạo vào **ASR_API_TOKEN** trong **.env**. Không commit file **.env** và không gửi token vào chat nhóm công khai. Mặc định file mẫu dùng cache model **./models**, lắng nghe tại **127.0.0.1:8767**, và cho phép FE local ở **http://127.0.0.1:8000**.
+
+Khởi động trong thư mục repo:
+
+~~~bash
+set -a
+source .env
+set +a
+export ASR_PYTHON="$PWD/.venv/bin/python"
 ./run.sh
-```
+~~~
 
-The launcher reuses `/home/phongnth/asr-bestmodel/.venv`; it does not create another 2.9 GB CUDA environment. `ASR_MODEL_CACHE` points at the retained local checkpoint. To use another checkpoint location, set `ASR_MODEL_PATH` to a local CTranslate2 snapshot containing `model.bin` and `config.json`. A missing model fails startup rather than downloading anything.
+Giữ terminal này mở; nhấn Ctrl+C để dừng. Khi chạy model từ repo riêng, đặt **ASR_MODEL_PATH** thành đường dẫn tuyệt đối tới thư mục sau khi ghép model, chẳng hạn **/path/to/model_ASR_testing/weights**. Thư mục đó phải có **model.bin** và **config.json**.
 
-By default the API binds to `127.0.0.1:8767`. Put it behind the host's HTTPS reverse proxy and access controls. Keep the API token private and send it only to QA testers. The API has one Uvicorn worker because each worker would load another model copy into GPU memory.
+## Chạy FE local và kết nối
 
-## Connect the Vercel QA frontend
+Mở terminal thứ hai:
 
-Deploy [fe_test_asr](https://github.com/pot030321/fe_test_asr) as a static Vercel project, then enter the backend HTTPS origin and API token in the UI. On the backend, set:
+~~~bash
+git clone https://github.com/pot030321/fe_test_asr.git
+cd fe_test_asr
+python3 -m http.server 8000 --bind 127.0.0.1
+~~~
 
-```bash
-ASR_ALLOWED_ORIGINS=https://your-project.vercel.app
-ASR_ALLOWED_ORIGIN_REGEX='^https://[a-z0-9-]+(-[a-z0-9-]+)?\.vercel\.app$'
-```
+Mở **http://127.0.0.1:8000**. Trên giao diện, nhập Backend API URL là **http://127.0.0.1:8767**, nhập token từ file **.env**, chọn file audio hoặc ghi âm rồi chạy nhận dạng. Nếu chọn host/port FE khác, thêm origin chính xác đó vào **ASR_ALLOWED_ORIGINS** rồi khởi động lại BE. **localhost** và **127.0.0.1** là hai origin khác nhau; dùng đúng địa chỉ đã mở trên trình duyệt.
 
-Replace the exact origin with your QA deployment. The regex permits Vercel preview hostnames; remove it if previews should not call the API. Vercel and the tester's browser cannot reach a private `192.168.x.x` server address over the public internet. The backend needs an HTTPS route reachable from the browser, or a VPN/private connectivity arrangement. The browser uses a custom token header, so the API's CORS preflight must be allowed.
+Để tester ở máy khác gọi BE, backend phải lắng nghe trên địa chỉ mạng phù hợp và có đường kết nối mà trình duyệt truy cập được. Khi truy cập qua Internet, đặt BE sau HTTPS reverse proxy hoặc mạng VPN có kiểm soát; không mở raw HTTP trực tiếp ra Internet. Thêm origin FE vào **ASR_ALLOWED_ORIGINS**. Vercel preview có thể được cho phép bằng **ASR_ALLOWED_ORIGIN_REGEX**, nhưng chỉ bật nếu team thật sự cần.
 
-## API contract
+## Endpoint và số liệu
 
-`POST /api/transcribe` accepts multipart form fields `file` and `language` (`auto`, `vi`, or `en`) with `X-ASR-Token`. It returns the transcript, detected language, audio duration, inference time, server request time, queue wait, file size, and RTF. RTF is `inference_s / audio_s`. `request_s` is measured inside the API; browser E2E additionally includes upload and network time.
+| Method và path | Xác thực | Mô tả |
+| --- | --- | --- |
+| GET /healthz | Không | Kiểm tra backend sẵn sàng. |
+| POST /api/transcribe | Header X-ASR-Token | Multipart gồm file và language: auto, vi hoặc en. Trả transcript, ngôn ngữ, thời lượng, queue, inference, request và RTF. |
+| GET /api/metrics | Header X-ASR-Token | Active requests, slots, queue, tổng thành công/lỗi và tối đa 100 request gần nhất. |
 
-`GET /api/metrics` uses the same `X-ASR-Token` and reports active requests, inference slots, queued requests, success/error totals, and the latest 100 request records. It stores timing and status metadata only—never audio or transcript—and the in-memory history resets when the API restarts. The FE polls this endpoint to show live CCU pressure and recent latency/RTF for requests from both the browser and load-test clients.
+RTF = inference_s / audio_s; chỉ tính inference, không tính queue, upload hoặc mạng. request_s được đo trong API và gồm thời gian chờ queue. Client E2E trên FE còn gồm upload và mạng. Metrics chỉ lưu metadata trong RAM, không có audio hoặc transcript; lịch sử mất khi BE restart. Giao diện gửi bản ghi sau khi bấm Dừng ghi, không phải nhận dạng streaming từng phần.
 
-Example:
+## Test và đo tải
 
-```bash
-curl -H "X-ASR-Token: $ASR_API_TOKEN" \
-  -F 'file=@sample.wav' -F 'language=vi' \
-  https://api.example.com/api/transcribe
-```
+Unit test dùng model giả nên không cần tải model hoặc chiếm GPU:
 
-## Tests
+~~~bash
+cd be_test_asr
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+~~~
 
-The unit tests mock the model and validate auth, multipart parsing, timing output, health, and Vercel CORS. Run them with the existing virtualenv:
+Đo tải HTTP thật từ máy có file audio và truy cập được backend:
 
-```bash
-PYTHONPATH=src /home/phongnth/asr-bestmodel/.venv/bin/python -m unittest discover -s tests -v
-```
+~~~bash
+export ASR_API_TOKEN='token-do-quan-ly-cap'
+python3 scripts/ccu_test.py --url http://127.0.0.1:8767 --audio ./sample.wav --language vi --ccu 1 4 8 12 16 20 --requests-per-client 5
+~~~
 
-To measure real HTTP request concurrency from a machine that has an audio sample and can reach the API:
+Script gửi inference thật và tối đa 20 client mỗi stage. Bắt đầu CCU thấp, sau đó tăng dần; theo dõi error rate, p95, queue, GPU memory và GPU utilization. Không chạy load test lúc team khác đang dùng chung GPU. Không commit audio mẫu vào repo.
 
-```bash
-ASR_API_TOKEN='...' python scripts/ccu_test.py \
-  --url https://api.example.com --audio ./sample.wav --language vi \
-  --ccu 1 4 8 12 16 20 --requests-per-client 5
-```
+## Mặc định và lỗi thường gặp
 
-This sends real inference traffic. Start with CCU 1, then increase gradually while watching GPU memory, server queue time, p95 latency, and error rate. The script caps a stage at 20 clients and does not upload or retain the sample in the repository.
+- API chạy một Uvicorn worker để chỉ nạp một bản model.
+- Mặc định GPU CUDA/float16, 4 model workers, tối đa 2 inference đồng thời, queue timeout 60 giây và file audio tối đa 100 MB.
+- Không tìm thấy checkpoint: kiểm tra **ASR_MODEL_PATH** hoặc **ASR_MODEL_CACHE**. BE không tự tải model.
+- Lỗi CUDA: dùng môi trường Python có CUDA/cuDNN tương thích hoặc chuyển sang CPU bằng các biến cấu hình ở trên.
+- HTTP 401: kiểm tra token ở BE và FE.
+- Lỗi CORS: thêm đúng origin của FE vào **ASR_ALLOWED_ORIGINS**, rồi restart BE.
+- HTTP 429 hoặc queue cao: giảm CCU hoặc điều chỉnh **ASR_MAX_INFLIGHT** và **ASR_QUEUE_TIMEOUT_S**.
+
+Tài liệu tham khảo: [cài đặt faster-whisper trên GPU](https://github.com/SYSTRAN/faster-whisper#gpu), [tải model bằng Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli).

@@ -14,7 +14,9 @@ if [[ -z "${ASR_API_TOKEN:-}" ]]; then
   exit 2
 fi
 
-CUDA_LIB_DIRS="$("$PY" -c 'import os, nvidia.cublas.lib, nvidia.cudnn.lib, nvidia.cuda_nvrtc.lib; print(os.pathsep.join((nvidia.cublas.lib.__path__[0], nvidia.cudnn.lib.__path__[0], nvidia.cuda_nvrtc.lib.__path__[0])))')"
-export LD_LIBRARY_PATH="$CUDA_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [[ "${ASR_DEVICE:-cuda}" == "cuda" ]]; then
+  CUDA_LIB_DIRS="$("$PY" -c 'import os, nvidia.cublas.lib, nvidia.cudnn.lib, nvidia.cuda_nvrtc.lib; print(os.pathsep.join((nvidia.cublas.lib.__path__[0], nvidia.cudnn.lib.__path__[0], nvidia.cuda_nvrtc.lib.__path__[0])))')"
+  export LD_LIBRARY_PATH="$CUDA_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PY" -m asr_api.main
